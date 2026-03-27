@@ -27,7 +27,7 @@
 | **训练功能** | **增强型训练脚本** (`9_train_crossscale.py`):<br>- **中断恢复**: 支持 `--resume` 自动加载最优权重断点续训。<br>- **快速验证**: 支持 `--test_epochs` 小批量试跑，防止无效长跑。 |
 | **数据结构** | 1. **S2 核心对齐 (Pivot logic)**: 重写 `CrossScaleDataset` 和 `evaluate.py`，改为以 S2 为基准寻找最近邻的 S1 和 MODIS，确保物理一致性线。 |
 | **架构修正** | 1. **断绝“模型偷懒”故障**: 修改 `8_crossscale_model.py` 的 Transformer 输入，强制训练/推理统一使用生成的 `plru`，禁止直接读取 MODIS 真值特征（MODIS 仅作监督）。<br>2. **激活 PHRU 损失**: 新增 `L_phru` 到 `CrossScaleLoss`，强制 `f4` 特征包含足够的空间拆解指引。 |
-| **Loss 调优 (V7.2)** | 1. **对抗 MODIS 平滑**: 调低 `lambda_cons` (0.3→0.1) 减弱 MODIS 低通滤波属性；调高 Pearson 散度权重 (0.5→1.5) 强制网络在 10m 级别拉高空间方差 ($std$)。<br>2. **训练周期延长**: `NUM_EPOCHS` 提升至 150，耐心值升至 35，适配大容量 Transformer 所需的拟合周期。 |
+| **Loss 调优 (V7.2)** | 1. **对抗 MODIS 平滑**: `lambda_cons` 0.3→0.1 (修复显式传参覆盖错误)；Pearson 散度权重 0.5→1.5 强制拉高空间方差。<br>2. **Transformer 正则化**: `weight_decay` 1e-4→1e-2，逐出“均值快捷”。<br>3. **调度器升级**: 替换 `ReduceLROnPlateau` → `CosineAnnealingLR` + 10-epoch 线性预热，保持中期探索动能。<br>4. **训练周期**: 150 epochs，`LR`=2e-4，断点恢复现包含 `scheduler_state`。 |
 | **系统同步** | 1. **`run.bat`**: 菜单升级至 V7 版。<br>2. **验证与打印**: 修复 `evaluate.py` 实例化与格式化报错。训练脚本控制台实时显示 `cont/cons/phru` 三重损失。 |
 
 ---

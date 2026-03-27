@@ -63,9 +63,8 @@ PATCH_SIZE        = 256
 LR_SIZE           = 5       # MODIS patch 在模型中的逻辑尺寸
 SAMPLES_PER_IMAGE = 200
 NUM_EPOCHS        = 150
-LEARNING_RATE     = 1e-4
-LR_PATIENCE       = 15
-LR_FACTOR          = 0.5
+LEARNING_RATE     = 2e-4     # 稍微激进，配合 Warmup 和大 Pearson 权重
+WARMUP_EPOCHS     = 10       # 前 10 轮线性预热，避免初期梯度爆炸
 EARLY_STOP_PATIENCE = 35
 CHECKPOINT_EVERY   = 5     # 每 N epoch 保存一次 checkpoint
 NUM_WORKERS        = 0
@@ -505,9 +504,10 @@ def main():
     params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"[模型] 参数量: {params:.2f} M")
 
-    loss_fn   = CrossScaleLoss(lambda_cons=0.3, lambda_temp=0.1, valid_threshold=0.05)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=LR_FACTOR, patience=LR_PATIENCE)
+    loss_fn   = CrossScaleLoss(lambda_cons=0.1, lambda_temp=0.1, valid_threshold=0.05)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
+    # 余弦退火调度器：不看 Loss 脸色，强制按余弦曲线平滑降温
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=actual_epochs, eta_min=1e-6)
     scaler    = (GradScaler(_AMP_DEVICE, enabled=use_amp) if _AMP_DEVICE else GradScaler(enabled=use_amp))
 
     best_val_loss   = float("inf")
@@ -526,6 +526,8 @@ def main():
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         if "scaler_state" in ckpt and scaler is not None:
             scaler.load_state_dict(ckpt["scaler_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
         print(f"[Resume] 从 Epoch {start_epoch} 恢复 (best_val_loss={best_val_loss:.6f})")
 
     # ── TensorBoard ───────────────────────────────────────────────
@@ -539,6 +541,8 @@ def main():
     print(f"\n{'═'*65}")
     print(f"  {mode_str}")
     print(f"  Batch={batch_size} | AMP={'ON' if use_amp else 'OFF'} | Resume={'ON' if args.resume else 'OFF'}")
+    print(f"  LR={LEARNING_RATE:.0e} | WD=1e-2 | Warmup={WARMUP_EPOCHS}ep | Scheduler=CosineAnnealing")
+    print(f"  Loss: λ_cons=0.1 | Pearson×1.5 | λ_phru=0.5")
     print(f"  Epochs: {start_epoch+1} → {end_epoch}")
     print(f"{'═'*65}\n")
 
@@ -551,7 +555,13 @@ def main():
             model, val_loader, loss_fn, device, epoch, end_epoch, use_amp
         )
 
-        scheduler.step(val_loss)
+        # Warmup: 前 WARMUP_EPOCHS 轮线性预热
+        if epoch < WARMUP_EPOCHS:
+            warmup_lr = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+        else:
+            scheduler.step()
         lr = get_lr(optimizer)
 
         writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch + 1)
@@ -573,6 +583,7 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "scaler_state": scaler.state_dict() if scaler else None,
+                "scheduler_state": scheduler.state_dict(),
             }, best_path)
             print(f"  -> BEST model saved (val_loss={val_loss:.6f})")
         else:
@@ -589,6 +600,7 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "scaler_state": scaler.state_dict() if scaler else None,
+                "scheduler_state": scheduler.state_dict(),
             }, ckpt_path)
             print(f"  [CKPT] Checkpoint 已保存 (Epoch {epoch+1})")
 
