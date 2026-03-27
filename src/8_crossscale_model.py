@@ -355,7 +355,7 @@ class CrossScaleLoss(nn.Module):
     三重约束损失函数:
       L_total = L_cont (纹理重构) + λ1 * L_cons (物理一致) + λ2 * L_temp (时间连续)
     """
-    def __init__(self, lambda_cons=0.3, lambda_temp=0.1, valid_threshold=0.05):
+    def __init__(self, lambda_cons=0.1, lambda_temp=0.1, valid_threshold=0.05):
         super().__init__()
         self.lambda_cons = lambda_cons
         self.lambda_temp = lambda_temp
@@ -397,7 +397,8 @@ class CrossScaleLoss(nn.Module):
         label_clean = torch.nan_to_num(label_hr, nan=0.0)
 
         l_cont = self._masked_loss(pred_hr, label_clean, mask_hr)
-        l_cont += 0.5 * self._pearson_loss(pred_hr, label_clean, mask_hr)
+        # 提高皮尔逊权重 (由 0.5 改为 1.5)，强制要求预测图具备和真值一样的空间起伏(std)，对抗平滑
+        l_cont += 1.5 * self._pearson_loss(pred_hr, label_clean, mask_hr)
 
         # ── L_cons: 物理一致性损失 (PLRU vs MODIS) ────────────────────
         # 将 MODIS 下采样到 PLRU 的尺度

@@ -25,8 +25,10 @@
 | **数据处理** | 1. **MODIS 对齐** (`7_align_modis.py`): 1000m→500m 重采样 + 重投影裁剪。<br>2. **严格 0.05 过滤**: 抛弃 0 值逻辑，改用 `NaN` 彻底隔离低 FPAR 噪声区域。 |
 | **模型架构** | **CrossScale-FPAR-Net** (`8_crossscale_model.py`): <br>- **Aggregation**: 高分特征聚合生成 Pseudo-LRU (PLRU)。<br>- **Disaggregation**: MODIS 引导特征拆解生成 Pseudo-HRU (PHRU)。<br>- **Triple Loss**: `L_cont` (纹理) + `L_cons` (物理一致性) + `L_temp` (时间连续)。 |
 | **训练功能** | **增强型训练脚本** (`9_train_crossscale.py`):<br>- **中断恢复**: 支持 `--resume` 自动加载最优权重断点续训。<br>- **快速验证**: 支持 `--test_epochs` 小批量试跑，防止无效长跑。 |
-| **数据结构** | 1. **S2 核心对齐 (Pivot logic)**: 重构 `CrossScaleDataset` 和 `evaluate.py`，改为以 S2 (FPAR 真值) 为基准寻找最近邻的 S1 和 MODIS。确保训练与评估逻辑完全一致。 |
-| **系统同步** | 1. **`run.bat`**: 菜单升级至 V7 版，包含 MODIS 对齐、CrossScale 训练/测试/续训/评估全流程。<br>2. **`evaluate.py`**: 修复了 `CrossScaleFPARNet` 实例化时的 `TypeError`。同步跨尺度模型推理，输出命名自动标记 `CROSSSCALE_`。 |
+| **数据结构** | 1. **S2 核心对齐 (Pivot logic)**: 重写 `CrossScaleDataset` 和 `evaluate.py`，改为以 S2 为基准寻找最近邻的 S1 和 MODIS，确保物理一致性线。 |
+| **架构修正** | 1. **断绝“模型偷懒”故障**: 修改 `8_crossscale_model.py` 的 Transformer 输入，强制训练/推理统一使用生成的 `plru`，禁止直接读取 MODIS 真值特征（MODIS 仅作监督）。<br>2. **激活 PHRU 损失**: 新增 `L_phru` 到 `CrossScaleLoss`，强制 `f4` 特征包含足够的空间拆解指引。 |
+| **Loss 调优 (V7.2)** | 1. **对抗 MODIS 平滑**: 调低 `lambda_cons` (0.3→0.1) 减弱 MODIS 低通滤波属性；调高 Pearson 散度权重 (0.5→1.5) 强制网络在 10m 级别拉高空间方差 ($std$)。<br>2. **训练周期延长**: `NUM_EPOCHS` 提升至 150，耐心值升至 35，适配大容量 Transformer 所需的拟合周期。 |
+| **系统同步** | 1. **`run.bat`**: 菜单升级至 V7 版。<br>2. **验证与打印**: 修复 `evaluate.py` 实例化与格式化报错。训练脚本控制台实时显示 `cont/cons/phru` 三重损失。 |
 
 ---
 
