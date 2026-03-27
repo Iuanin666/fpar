@@ -382,7 +382,7 @@ def custom_collate(batch):
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, num_epochs, use_amp):
     model.train()
     epoch_loss = 0.0
-    loss_details_sum = {'L_cont': 0, 'L_cons': 0, 'L_temp': 0}
+    loss_details_sum = {'L_cont': 0, 'L_cons': 0, 'L_phru': 0, 'L_temp': 0}
     lr = get_lr(optimizer)
 
     pbar = tqdm(loader, desc=f"Train [{epoch+1:>3}/{num_epochs}]", ncols=110, leave=False)
@@ -561,7 +561,7 @@ def main():
 
         print(f"Epoch [{epoch+1:>3}/{end_epoch}] "
               f"train={train_loss:.5f} val={val_loss:.5f} lr={lr:.1e}"
-              f" | cont={details['L_cont']:.4f} cons={details['L_cons']:.4f}")
+              f" | cont={details['L_cont']:.4f} cons={details['L_cons']:.4f} phru={details['L_phru']:.4f}")
 
         # Best model
         if val_loss < best_val_loss:

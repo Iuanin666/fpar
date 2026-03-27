@@ -315,7 +315,7 @@ class CrossScaleFPARNet(nn.Module):
     def forward(self, s1_input, modis_lr=None):
         """
         s1_input: (B, 7, 256, 256) - S1 SAR + Terrain + Meta
-        modis_lr: (B, 1, lr_h, lr_w) - MODIS FPAR (训练时必须提供)
+        modis_lr: (B, 1, lr_h, lr_w) - MODIS FPAR (仅用于训练时的知识蒸馏监督)
         """
         # 1. HR Encoder
         f1, f2, f3, f4 = self.hr_encoder(s1_input)
@@ -325,23 +325,21 @@ class CrossScaleFPARNet(nn.Module):
 
         # 3. Disaggregation: 低→高 (生成 PHRU)
         if modis_lr is not None:
+            # 训练时：用真实 MODIS 测试拆解能力，通过 L_phru 约束学习
             phru = self.disaggregation(modis_lr, f4)  # (B, 1, 256, 256)
         else:
-            # 推理时没有 MODIS,使用 PLRU 自身作为 LR 输入
+            # 推理时：使用自己生成的 PLRU 拆解
             phru = self.disaggregation(plru, f4)
 
-        # 4. CrossScale Transformer
-        if modis_lr is not None:
-            bottleneck = self.cross_transformer(f4, modis_lr)
-        else:
-            bottleneck = self.cross_transformer(f4, plru)
+        # 4. CrossScale Transformer [核心修复！]
+        # 无论训练还是推理，统一使用自己生成的 plru。
+        # 断绝模型对真实 MODIS 的"偷懒依赖"，迫使网络从 S1 雷达纹理中硬推 FPAR。
+        # MODIS 只通过 L_cons 和 L_phru 提供知识蒸馏监督。
+        bottleneck = self.cross_transformer(f4, plru)
 
         # 5. Decoder
         pred_hr = self.decoder(bottleneck, [f1, f2, f3])
 
-        # 【修复】在使用 CrossScaleLoss 时（无论 train 还是 val），都需要 plru 和 phru
-        # 因此，如果在 validation 阶段需要计算 validation loss，必须向外暴露
-        # 推理阶段 (evaluate.py) 不提供 modis_lr（或者只关心 pred_hr），因此我们可以通过 modis_lr 是否传入决定返回值
         if self.training or modis_lr is not None:
             return pred_hr, plru, phru
         else:
@@ -408,17 +406,26 @@ class CrossScaleLoss(nn.Module):
         mask_lr = (modis_ds > 0.01).float()
         l_cons = self._masked_loss(plru, modis_ds, mask_lr)
 
+        # ── L_phru: 拆解重建损失 (PHRU vs S2 真值) [新增！] ───────────
+        # 迫使 S1 特征 (f4) 必须包含足够的空间引导信息，
+        # 才能辅助 MODIS 从 5×5 解压回 256×256 的高分图。
+        l_phru = self._masked_loss(phru, label_clean, mask_hr)
+
         # ── L_temp: 时间连续性损失 (可选) ─────────────────────────────
         l_temp = pred_hr.new_tensor(0.0)
         if prev_pred is not None:
             l_temp = F.mse_loss(pred_hr, prev_pred)
 
         # ── 总损失 ────────────────────────────────────────────────────
-        total = l_cont + self.lambda_cons * l_cons + self.lambda_temp * l_temp
+        total = (l_cont
+                 + self.lambda_cons * l_cons
+                 + 0.5 * l_phru
+                 + self.lambda_temp * l_temp)
 
         return total, {
             'L_cont': l_cont.item(),
             'L_cons': l_cons.item(),
+            'L_phru': l_phru.item(),
             'L_temp': l_temp.item(),
             'L_total': total.item(),
         }

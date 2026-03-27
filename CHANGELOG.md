@@ -1,3 +1,19 @@
+## [2026-03-27 10:30] 🔴 V7.1 致命架构修复：知识蒸馏模式 + PHRU 损失激活
+
+### 致命 Bug 修复
+| Bug | 问题描述 | 修复方案 |
+|-----|----------|----------|
+| **训练-推理脱节** | Transformer 训练时直接吃真实 MODIS，推理时被迫用自生 PLRU，导致模型"偷懒"不学 S1 纹理，推理时输出均值图 (R²<0)。 | **强制统一**：Transformer 无论训练还是推理，都只使用自生成的 `plru`。MODIS 降级为知识蒸馏教师，仅通过 `L_cons` 提供监督。 |
+| **PHRU 死代码** | `DisaggregationModule` 生成了 `phru`，但 Loss 函数从未使用它，该分支无梯度回传。 | **激活 `L_phru`**：新增 `L_phru = HuberLoss(phru, S2_label)`，权重 0.5，迫使 S1 特征必须包含空间引导信息。 |
+
+### 修改文件
+| 文件 | 修改 |
+|------|------|
+| `src/8_crossscale_model.py` | 1. `forward()`: 删除 `if modis_lr` 的 Transformer 分支，统一走 `plru`。<br>2. `CrossScaleLoss`: 新增 `L_phru` 分支 + 更新总损失公式。 |
+| `src/9_train_crossscale.py` | 同步 `loss_details_sum` 加入 `L_phru`，Epoch 日志打印新增 `phru=` 字段。 |
+
+---
+
 ## [2026-03-26 10:00] 🌐 V7 跨尺度时空融合：双向拼接对比学习与 MODIS 整合
 
 ### 核心革新
