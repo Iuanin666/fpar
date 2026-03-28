@@ -1,34 +1,51 @@
-## [2026-03-27 10:30] 🔴 V7.1 致命架构修复：知识蒸馏模式 + PHRU 损失激活
+## [2026-03-28 16:30] V7.3 Anti-Noise and Temporal Awareness
+> **Core**: Stop blindly chasing noisy S2 labels. Make the model temporally-aware and noise-robust.
 
-### 致命 Bug 修复
-| Bug | 问题描述 | 修复方案 |
-|-----|----------|----------|
-| **训练-推理脱节** | Transformer 训练时直接吃真实 MODIS，推理时被迫用自生 PLRU，导致模型"偷懒"不学 S1 纹理，推理时输出均值图 (R²<0)。 | **强制统一**：Transformer 无论训练还是推理，都只使用自生成的 `plru`。MODIS 降级为知识蒸馏教师，仅通过 `L_cons` 提供监督。 |
-| **PHRU 死代码** | `DisaggregationModule` 生成了 `phru`，但 Loss 函数从未使用它，该分支无梯度回传。 | **激活 `L_phru`**：新增 `L_phru = HuberLoss(phru, S2_label)`，权重 0.5，迫使 S1 特征必须包含空间引导信息。 |
-
-### 修改文件
-| 文件 | 修改 |
-|------|------|
-| `src/8_crossscale_model.py` | 1. `forward()`: 删除 `if modis_lr` 的 Transformer 分支，统一走 `plru`。<br>2. `CrossScaleLoss`: 新增 `L_phru` 分支 + 更新总损失公式。 |
-| `src/9_train_crossscale.py` | 同步 `loss_details_sum` 加入 `L_phru`，Epoch 日志打印新增 `phru=` 字段。 |
+### Changes (V7.3)
+| Dimension | Change | The Why |
+|-----------|--------|---------|
+| **DOY Encoding** | Linear `doy/366` -> cyclic `sin/cos` (IN_CHANNELS 7->8) | 12/31 and 1/1 should be neighbors, not opposites. Circular encoding preserves seasonal continuity. |
+| **Label Denoise** | 3x3 median filter on training labels | Remove salt-and-pepper noise from S2 FPAR while preserving field boundaries (unlike avg_pool). |
+| **Temporal Loss** | `L_cont * max(0.3, 1-abs(dt)/30)` | Large S1-S2 gaps (dt=35 days) are physically unreliable. Decay trust but keep 30% floor to avoid data waste. |
+| **Pearson Weight** | 1.5 -> 1.0 | Median filter removes noise, so aggressive variance forcing is no longer needed. |
 
 ---
 
-## [2026-03-26 10:00] 🌐 V7 跨尺度时空融合：双向拼接对比学习与 MODIS 整合
+## [2026-03-27 15:00] V7.2 Anti-Smoothing and Training Pipeline Overhaul ⚡ V7.2 性能冲刺：对抗平滑效应与训练管线优化
+> **核心思路**：解决跨尺度模型在"物理约束"与"空间纹理"博弈中的倾斜问题。通过给 MODIS 约束“松绑”并强化 Pearson 相关性，逼迫模型从均值陷阱中跳出。
 
-### 核心革新
-基于"双向拼接对比学习 (Bi-directional Patch Contrastive Learning)"架构，正式引入 MODIS 旬合成 FPAR 产品作为低分辨率 (LRU) 先验物理约束，实现 10m ↔ 500m 的跨尺度特征 disaggregation 与聚集映射。
+### 优化明细 (V7.2)
+| 维度 | 修改内容 | 解决的问题 (The Why) |
+|------|----------|----------------------|
+| **Loss 权重** | `lambda_cons`: 0.3 → 0.1 | **解决平滑效应**：MODIS (500m) 本质是低通滤波器。原 0.3 权重过高导致模型为了安全不敢生成 S1 高阶纹理。0.1 让其回归“大方向指导”角色，释放 S1 自主权。 |
+| **纹理增强** | `Pearson`: 0.5 → 1.5 | **拉高方差**：Pearson 不看绝对值只看空间波动。1.5 倍权重强制预测图具备与真值一致的 $std$ (起伏)，对抗平滑输出。 |
+| **正则化** | `weight_decay`: 1e-4 → 1e-2 | **跳出均值捷径**：Transformer 易过拟合捷径。大 WD 逼迫 17M 参数挖掘真正的微波散射特征，防止模型简单猜一个平均值。 |
+| **调度器** | `ReduceLROnPlateau` → `Cosine + Warmup` | **保持探索动能**：不再因为 Loss 暂时不降就机械减速。Cosine 保证中前期有充足动能跨越平滑陷阱，10 轮 Warmup 防止初期梯度跑飞。 |
+| **系统同步** | `scheduler_state` 序列化 | **解决中断断层**：现在 `--resume` 续训可以完美继承余弦退火的学习率位置，防止中途断电导致步调不一致。 |
 
-### 修复与新特性
-| 维度 | 修改内容 |
-|------|----------|
-| **数据处理** | 1. **MODIS 对齐** (`7_align_modis.py`): 1000m→500m 重采样 + 重投影裁剪。<br>2. **严格 0.05 过滤**: 抛弃 0 值逻辑，改用 `NaN` 彻底隔离低 FPAR 噪声区域。 |
-| **模型架构** | **CrossScale-FPAR-Net** (`8_crossscale_model.py`): <br>- **Aggregation**: 高分特征聚合生成 Pseudo-LRU (PLRU)。<br>- **Disaggregation**: MODIS 引导特征拆解生成 Pseudo-HRU (PHRU)。<br>- **Triple Loss**: `L_cont` (纹理) + `L_cons` (物理一致性) + `L_temp` (时间连续)。 |
-| **训练功能** | **增强型训练脚本** (`9_train_crossscale.py`):<br>- **中断恢复**: 支持 `--resume` 自动加载最优权重断点续训。<br>- **快速验证**: 支持 `--test_epochs` 小批量试跑，防止无效长跑。 |
-| **数据结构** | 1. **S2 核心对齐 (Pivot logic)**: 重写 `CrossScaleDataset` 和 `evaluate.py`，改为以 S2 为基准寻找最近邻的 S1 和 MODIS，确保物理一致性线。 |
-| **架构修正** | 1. **断绝“模型偷懒”故障**: 修改 `8_crossscale_model.py` 的 Transformer 输入，强制训练/推理统一使用生成的 `plru`，禁止直接读取 MODIS 真值特征（MODIS 仅作监督）。<br>2. **激活 PHRU 损失**: 新增 `L_phru` 到 `CrossScaleLoss`，强制 `f4` 特征包含足够的空间拆解指引。 |
-| **Loss 调优 (V7.2)** | 1. **对抗 MODIS 平滑**: `lambda_cons` 0.3→0.1 (修复显式传参覆盖错误)；Pearson 散度权重 0.5→1.5 强制拉高空间方差。<br>2. **Transformer 正则化**: `weight_decay` 1e-4→1e-2，逐出“均值快捷”。<br>3. **调度器升级**: 替换 `ReduceLROnPlateau` → `CosineAnnealingLR` + 10-epoch 线性预热，保持中期探索动能。<br>4. **训练周期**: 150 epochs，`LR`=2e-4，断点恢复现包含 `scheduler_state`。 |
-| **系统同步** | 1. **`run.bat`**: 菜单升级至 V7 版。<br>2. **验证与打印**: 修复 `evaluate.py` 实例化与格式化报错。训练脚本控制台实时显示 `cont/cons/phru` 三重损失。 |
+---
+
+## [2026-03-27 11:30] 🔴 V7.1 架构订正：知识蒸馏模式 (Anti-Cheating)
+> **核心思路**：断绝模型对真实 MODIS 的"偷懒依赖"，强制其通过 S1 纹理进行硬推。
+
+### 关键修复 (V7.1)
+| 修复项 | 技术实现 | 解决的问题 (The Why) |
+|------|----------|----------------------|
+| **Transformer 输入** | 统一强制使用生成的 `plru` | **防止训练弊**：原先训练用真值、推理用模拟，导致训练时模型根本没在学 S1 特征。现在无论训练推理，一律只看 `plru`。 |
+| **PHRU 损失激活** | 新增 `L_phru` (Huber) | **拯救死代码**：让 `DisaggregationModule` 分支参与梯度回传，强制特征层具备空间拆解指引能力。 |
+
+---
+
+## [2026-03-26 10:00] 🌐 V7 跨尺度融合：MODIS 先验整合 (Base Version)
+> **核心思路**：引入低分辨率物理约束，将 500m MODIS 旬合成产品整合进数据流。
+
+### 核心特性 (V7.0)
+| 维度 | 修改内容 | 解决的问题 (The Why) |
+|------|----------|----------------------|
+| **数据处理** | `7_align_modis.py`: 1000m→500m 重采样 | **分辨率对齐**：建立 50:1 的空间映射关系，确立物理一致性判别基准。 |
+| **数据结构** | **Pivot logic** (以 S2 为基准锚点) | **时间一致性**：重写数据集匹配逻辑，确保 S1 和 MODIS 都是围着 S2 真值在动，消除时间跨度累积误差。 |
+| **模型架构** | **CrossScale-FPAR-Net** (`8_crossscale_model.py`) | **架构进阶**：实现 Aggregation (高→低) 与 Disaggregation (低→高) 双向映射，支持多尺度特征融合。 |
+| **训练功能** | 支持 `--resume` 与 `--test_epochs` | **可靠性提升**：由于 V7 模型参数规模翻倍，必须支持断点恢复以应对 Windows 意外波动。 |
 
 ---
 

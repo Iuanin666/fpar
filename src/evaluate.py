@@ -70,7 +70,7 @@ TEST_DATES = "all"
 MAX_TIME_DIFF = 180   # SenRVM策略: 放宽硬拼接时间差限制至 180 天，将时间差作为动态权重特征交还给注意力层去挖掘
 
 # ── 模型结构参数（需与训练时一致） ───────────────────────────────────
-IN_CHANNELS = 7    # VV + VH + 3-Terrain + Delta + DOY
+IN_CHANNELS = 8    # VV + VH + 3-Terrain + Delta + DOY_sin + DOY_cos
 PATCH_SIZE  = 256  # 推理时的滑窗大小（同训练 PATCH_SIZE）
 
 # ── 推理配置 ──────────────────────────────────────────────────────────
@@ -151,13 +151,13 @@ def find_all_pairs(s1_dir: str, label_dir: str, max_time_diff: int = 180):
 def sliding_window_inference(
     model, s1_data: np.ndarray, dem_data: np.ndarray, 
     dem_min: list, dem_max: list,
-    delta_norm: float, doy_norm: float,
+    delta_norm: float, doy_sin: float, doy_cos: float,
     patch_size: int, stride: int,
     device: torch.device, use_amp: bool
 ) -> np.ndarray:
     """
     对整景 S1 影像做滑动窗口推理，返回与输入同空间分辨率的预测 FPAR 图（H, W）。
-    输入包含 7 个通道逻辑：[VV, VH, Elevation, Slope, Aspect, DeltaT, DOY]
+    输入包含 8 个通道: [VV, VH, Elevation, Slope, Aspect, DeltaT, DOY_sin, DOY_cos]
     """
     _, H, W = s1_data.shape
     pred_sum = np.zeros((H, W), dtype=np.float32)
@@ -174,7 +174,7 @@ def sliding_window_inference(
     VV_MIN, VV_MAX = -30.0, 5.0
     VH_MIN, VH_MAX = -35.0, 5.0
 
-    print(f"  [推理] 正在执行 7-通道滑动窗口推理...")
+    print(f"  [推理] 正在执行 8-通道滑动窗口推理...")
 
     with torch.no_grad():
         for top in tops:
@@ -194,13 +194,14 @@ def sliding_window_inference(
                     norm = (p_dem[i] - dem_min[i]) / (denom if denom > 1e-6 else 1.0)
                     p_dem_norms.append(torch.from_numpy(norm[np.newaxis]).float())
                 
-                # 4. 构造 7 通道 Tensor: [2 S1, 3 Terrain, 1 Delta, 1 DOY]
+                # 4. 构造 8 通道 Tensor: [2 S1, 3 Terrain, 1 Delta, 1 DOY_sin, 1 DOY_cos]
                 t_s1    = torch.from_numpy(p_s1).float()
                 t_dem   = torch.cat(p_dem_norms, dim=0)
                 t_delta = torch.full((1, patch_size, patch_size), delta_norm, dtype=torch.float32)
-                t_doy   = torch.full((1, patch_size, patch_size), doy_norm, dtype=torch.float32)
+                t_doy_sin = torch.full((1, patch_size, patch_size), doy_sin, dtype=torch.float32)
+                t_doy_cos = torch.full((1, patch_size, patch_size), doy_cos, dtype=torch.float32)
                 
-                x = torch.cat([t_s1, t_dem, t_delta, t_doy], dim=0).unsqueeze(0).to(device)
+                x = torch.cat([t_s1, t_dem, t_delta, t_doy_sin, t_doy_cos], dim=0).unsqueeze(0).to(device)
 
                 with autocast(enabled=use_amp):
                     y = model(x)
@@ -313,12 +314,14 @@ def evaluate_single(
     d1 = datetime.strptime(s1_date, "%Y%m%d")
     d2 = datetime.strptime(s2_date, "%Y%m%d")
     
-    # 归一化元数据特征 (需与 2_dataset.py 严格一致)
+    # 归一化元数据特征 (需与 9_train_crossscale.py 严格一致)
     delta_norm = (d1 - d2).days / 30.0
-    doy_norm   = float(d1.timetuple().tm_yday) / 366.0
+    doy = float(d1.timetuple().tm_yday)
+    doy_sin = math.sin(2 * math.pi * doy / 365.25)
+    doy_cos = math.cos(2 * math.pi * doy / 365.25)
 
     print(f"\n{'─'*60}")
-    print(f"  评估场次: S1={s1_date} <-> S2={s2_date} (DOY: {d1.timetuple().tm_yday})")
+    print(f"  评估场次: S1={s1_date} <-> S2={s2_date} (DOY: {int(doy)})")
     print(f"  时间偏差: {delta_norm*30:.1f} 天 (Norm: {delta_norm:.4f})")
     print(f"{'─'*60}")
 
@@ -344,7 +347,7 @@ def evaluate_single(
     # 执行滑窗推理
     pred_map = sliding_window_inference(
         model, s1_data, dem_aligned, dem_min, dem_max,
-        delta_norm, doy_norm,
+        delta_norm, doy_sin, doy_cos,
         PATCH_SIZE, stride, device, use_amp
     )
     pred_map = np.clip(pred_map, 0.0, 1.0)

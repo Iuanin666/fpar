@@ -16,6 +16,7 @@ import re
 import time
 import argparse
 import random
+import math
 from datetime import datetime
 
 import numpy as np
@@ -57,7 +58,7 @@ MODEL_SAVE_DIR = r"E:\FPAR_project\models"
 LOG_DIR        = r"E:\FPAR_project\runs_crossscale"
 
 HOLDOUT_DATE      = "20250719"
-IN_CHANNELS       = 7
+IN_CHANNELS       = 8        # V7.3: VV, VH, Elev, Slope, Aspect, DeltaT, DOY_sin, DOY_cos
 BATCH_SIZE        = 4       # CrossScale 模型较大，从安全起步
 PATCH_SIZE        = 256
 LR_SIZE           = 5       # MODIS patch 在模型中的逻辑尺寸
@@ -308,12 +309,16 @@ class CrossScaleDataset(Dataset):
             dem_norms.append(torch.from_numpy(p_n[np.newaxis].copy()).float())
 
         # 元数据通道
+        delta_days = abs((d1 - d2).days)  # 保留绝对天数，给 Loss 做时间衰减
         delta_norm = (d1 - d2).days / 30.0
-        doy_norm = float(d1.timetuple().tm_yday) / 366.0
+        doy = float(d1.timetuple().tm_yday)
+        doy_sin = math.sin(2 * math.pi * doy / 365.25)
+        doy_cos = math.cos(2 * math.pi * doy / 365.25)
         delta_ch = torch.full((1, ps, ps), delta_norm, dtype=torch.float32)
-        doy_ch = torch.full((1, ps, ps), doy_norm, dtype=torch.float32)
+        doy_sin_ch = torch.full((1, ps, ps), doy_sin, dtype=torch.float32)
+        doy_cos_ch = torch.full((1, ps, ps), doy_cos, dtype=torch.float32)
 
-        input_tensor = torch.cat([s1_t, *dem_norms, delta_ch, doy_ch], dim=0)
+        input_tensor = torch.cat([s1_t, *dem_norms, delta_ch, doy_sin_ch, doy_cos_ch], dim=0)  # (8, ps, ps)
 
         # ── 严格 0.05 过滤: 设为 NaN 而非 0 ──────────────────────────
         label_t = torch.from_numpy(label_patch.copy()).float().unsqueeze(0)
@@ -338,7 +343,7 @@ class CrossScaleDataset(Dataset):
         else:
             modis_t = torch.zeros((1, LR_SIZE, LR_SIZE), dtype=torch.float32)
 
-        # ── 数据增强 ──────────────────────────────────────────────────
+        # ── 数据增强（仅训练集）────────────────────────────────────────
         if self.split == "train":
             if random.random() > 0.5:
                 input_tensor = torch.flip(input_tensor, [2])
@@ -351,7 +356,16 @@ class CrossScaleDataset(Dataset):
                 input_tensor = torch.rot90(input_tensor, k, [1, 2])
                 label_t = torch.rot90(label_t, k, [1, 2])
 
-        return input_tensor, label_t, modis_t
+        # ── 标签中值滤波（去椒盐噪声，保留边缘）────────────────────
+        if self.split == "train":
+            valid_mask = ~torch.isnan(label_t)
+            label_for_filt = torch.nan_to_num(label_t, nan=0.0)
+            padded = torch.nn.functional.pad(label_for_filt, (1, 1, 1, 1), mode='reflect')
+            patches = padded.unfold(1, 3, 1).unfold(2, 3, 1)  # (1, H, W, 3, 3)
+            median_val = patches.contiguous().view(1, ps, ps, 9).median(dim=-1).values
+            label_t = torch.where(valid_mask, median_val, label_t)
+
+        return input_tensor, label_t, modis_t, delta_days
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -364,9 +378,10 @@ def get_lr(optimizer):
 
 def custom_collate(batch):
     """自定义 collate: MODIS patch 大小可能不同, 统一 resize 到 LR_SIZE."""
-    inputs, labels, modis_list = zip(*batch)
+    inputs, labels, modis_list, delta_days_list = zip(*batch)
     inputs = torch.stack(inputs)
     labels = torch.stack(labels)
+    delta_days = torch.tensor(delta_days_list, dtype=torch.float32)  # (B,)
     # Resize MODIS patches to uniform size
     modis_resized = []
     for m in modis_list:
@@ -375,7 +390,7 @@ def custom_collate(batch):
         ).squeeze(0)
         modis_resized.append(m_r)
     modis = torch.stack(modis_resized)
-    return inputs, labels, modis
+    return inputs, labels, modis, delta_days
 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, num_epochs, use_amp):
@@ -386,10 +401,11 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, nu
 
     pbar = tqdm(loader, desc=f"Train [{epoch+1:>3}/{num_epochs}]", ncols=110, leave=False)
 
-    for inputs, labels, modis in pbar:
+    for inputs, labels, modis, delta_days in pbar:
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         modis  = modis.to(device, non_blocking=True)
+        delta_days = delta_days.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -397,7 +413,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, nu
                    if _AMP_DEVICE else autocast(enabled=use_amp))
         with amp_ctx:
             pred_hr, plru, phru = model(inputs, modis)
-            loss, details = loss_fn(pred_hr, plru, phru, labels, modis)
+            loss, details = loss_fn(pred_hr, plru, phru, labels, modis, delta_t=delta_days)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -423,16 +439,17 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, num_epochs, use_am
 
     pbar = tqdm(loader, desc=f"Val   [{epoch+1:>3}/{num_epochs}]", ncols=110, leave=False)
 
-    for inputs, labels, modis in pbar:
+    for inputs, labels, modis, delta_days in pbar:
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         modis  = modis.to(device, non_blocking=True)
+        delta_days = delta_days.to(device, non_blocking=True)
 
         amp_ctx = (autocast(_AMP_DEVICE, enabled=use_amp)
                    if _AMP_DEVICE else autocast(enabled=use_amp))
         with amp_ctx:
             pred_hr, plru, phru = model(inputs, modis)
-            loss, _ = loss_fn(pred_hr, plru, phru, labels, modis)
+            loss, _ = loss_fn(pred_hr, plru, phru, labels, modis, delta_t=delta_days)
 
         epoch_loss += loss.item()
         pbar.set_postfix(loss=f"{loss.item():.4f}")

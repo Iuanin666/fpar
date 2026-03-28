@@ -14,6 +14,7 @@
 import os
 import re
 import random
+import math
 from datetime import datetime
 
 import torch
@@ -345,11 +346,14 @@ class FPAR_Fusion_Dataset(Dataset):
         delta_norm = (d1 - d2).days / 30.0
         delta_channel = torch.full((1, ps, ps), delta_norm, dtype=torch.float32)
 
-        # 2. DOY (一年中的第几天) - 提供强力的季节先验 (归一化到 [0, 1])
-        doy_norm = float(d1.timetuple().tm_yday) / 366.0
-        doy_channel = torch.full((1, ps, ps), doy_norm, dtype=torch.float32)
+        # 2. DOY (一年中的第几天) - 周期性三角函数编码
+        doy = float(d1.timetuple().tm_yday)
+        doy_sin = math.sin(2 * math.pi * doy / 365.25)
+        doy_cos = math.cos(2 * math.pi * doy / 365.25)
+        doy_sin_channel = torch.full((1, ps, ps), doy_sin, dtype=torch.float32)
+        doy_cos_channel = torch.full((1, ps, ps), doy_cos, dtype=torch.float32)
 
-        # ── 拼接最终 7 通道输入: (VV, VH, Elevation, Slope, Aspect, DeltaT, DOY) ──
+        # ── 拼接最终 8 通道输入: (VV, VH, Elevation, Slope, Aspect, DeltaT, DOY_sin, DOY_cos) ──
         # 1. 地形通道自适应归一化 (根据全局 Min-Max)
         dem_norm_patches = []
         if self.dem_data is not None:
@@ -366,7 +370,8 @@ class FPAR_Fusion_Dataset(Dataset):
             input_tensor,           # (2, ps, ps) - VV, VH
             *dem_norm_patches,      # (3, ps, ps) - Elevation, Slope, Aspect
             delta_channel,          # (1, ps, ps) - DeltaT
-            doy_channel             # (1, ps, ps) - DOY
+            doy_sin_channel,        # (1, ps, ps) - DOY_sin
+            doy_cos_channel         # (1, ps, ps) - DOY_cos
         ], dim=0)
 
         # FPAR 物理范围 0~1，严格强制截断 <0.05 超范围的底噪值以免毒害模型

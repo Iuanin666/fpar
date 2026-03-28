@@ -301,7 +301,7 @@ class CrossScaleFPARNet(nn.Module):
     训练时返回: (pred_hr, plru, phru)
     推理时返回: pred_hr
     """
-    def __init__(self, in_channels=7, lr_size=5, patch_size=256):
+    def __init__(self, in_channels=8, lr_size=5, patch_size=256):
         super().__init__()
         self.patch_size = patch_size
 
@@ -383,7 +383,7 @@ class CrossScaleLoss(nn.Module):
         return 1.0 - pearson
 
     def forward(self, pred_hr, plru, phru, label_hr, modis_lr,
-                prev_pred=None):
+                prev_pred=None, delta_t=None):
         """
         pred_hr:   (B, 1, H, W)     - 最终 10m FPAR 预测
         plru:      (B, 1, 5, 5)     - 聚合生成的低分伪 FPAR
@@ -391,14 +391,15 @@ class CrossScaleLoss(nn.Module):
         label_hr:  (B, 1, H, W)     - S2 真值
         modis_lr:  (B, 1, lr_h, lr_w) - MODIS 真值
         prev_pred: (B, 1, H, W)     - 上一个时间步的预测 (可选)
+        delta_t:   (B,)              - 每个样本的 S1-S2 时间差天数 (可选)
         """
         # ── L_cont: 纹理重构损失 (主损失) ─────────────────────────────
         mask_hr = (~torch.isnan(label_hr)).float()
         label_clean = torch.nan_to_num(label_hr, nan=0.0)
 
         l_cont = self._masked_loss(pred_hr, label_clean, mask_hr)
-        # 提高皮尔逊权重 (由 0.5 改为 1.5)，强制要求预测图具备和真值一样的空间起伏(std)，对抗平滑
-        l_cont += 1.5 * self._pearson_loss(pred_hr, label_clean, mask_hr)
+        # Pearson 权重 1.0（配合中值滤波去噪后不需要太激进）
+        l_cont += 1.0 * self._pearson_loss(pred_hr, label_clean, mask_hr)
 
         # ── L_cons: 物理一致性损失 (PLRU vs MODIS) ────────────────────
         # 将 MODIS 下采样到 PLRU 的尺度
@@ -418,6 +419,12 @@ class CrossScaleLoss(nn.Module):
             l_temp = F.mse_loss(pred_hr, prev_pred)
 
         # ── 总损失 ────────────────────────────────────────────────────
+        # 时间衰减权重：时差越大，L_cont 贡献越小（缓和线性衰减 + 0.3 底线）
+        if delta_t is not None:
+            w = torch.clamp(1.0 - delta_t / 30.0, min=0.3)  # (B,)
+            w_mean = w.mean()
+            l_cont = l_cont * w_mean
+
         total = (l_cont
                  + self.lambda_cons * l_cons
                  + 0.5 * l_phru
@@ -439,12 +446,12 @@ class CrossScaleLoss(nn.Module):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = CrossScaleFPARNet(in_channels=7, lr_size=5, patch_size=256).to(device)
+    model = CrossScaleFPARNet(in_channels=8, lr_size=5, patch_size=256).to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"CrossScaleFPARNet 参数量: {total_params:.2f} M")
 
     # 模拟输入
-    s1 = torch.randn(2, 7, 256, 256).to(device)
+    s1 = torch.randn(2, 8, 256, 256).to(device)
     modis = torch.randn(2, 1, 5, 5).to(device)
 
     # 训练模式
