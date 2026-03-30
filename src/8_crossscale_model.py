@@ -100,6 +100,8 @@ class FiLM_Layer(nn.Module):
     def forward(self, feature, meta):
         film_params = self.mlp(meta)
         gamma, beta = film_params.chunk(2, dim=1)
+        # 添加极值约束: 使用 tanh 防止在极端的元数据差异下 gamma 膨胀引发 FP16 乘法溢出
+        gamma = torch.tanh(gamma)
         gamma = gamma.view(-1, feature.size(1), 1, 1)
         beta = beta.view(-1, feature.size(1), 1, 1)
         return feature * (1 + gamma) + beta
@@ -425,10 +427,21 @@ class CrossScaleLoss(nn.Module):
         t = target[mask > 0]
         if p.numel() < 2:
             return (pred * 0.0).sum()
-        mean_p, std_p = p.mean(), p.std() + 1e-8
-        mean_t, std_t = t.mean(), t.std() + 1e-8
+        
+        std_p = p.std()
+        std_t = t.std()
+        
+        # 极重要！AMP fp16 下 1e-8 会被截断为 0。
+        # 如果 Patch 几乎全平（std ≈ 0），直接触发除零大爆炸。必须在分子/分母计算前硬拦截。
+        if std_p < 1e-4 or std_t < 1e-4:
+            return (pred * 0.0).sum()
+            
+        mean_p = p.mean()
+        mean_t = t.mean()
+        
         cov = ((p - mean_p) * (t - mean_t)).mean()
-        pearson = cov / (std_p * std_t)
+        # 分母再加一次微小保护，防止前两步精度折损
+        pearson = cov / (std_p * std_t + 1e-8)
         return 1.0 - pearson
 
     def forward(self, pred_hr, plru, phru, label_hr, modis_lr, modis_agg=None, prev_pred=None, delta_t=None):
