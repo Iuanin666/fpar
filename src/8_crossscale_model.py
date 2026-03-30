@@ -97,7 +97,10 @@ class FiLM_Layer(nn.Module):
         film_params = self.mlp(meta)
         gamma, beta = film_params.chunk(2, dim=1)
         # 添加极值约束: 使用 tanh 防止在极端的元数据差异下 gamma 膨胀引发 FP16 乘法溢出
-        gamma = torch.tanh(gamma)
+        # 放宽限制：允许 gamma 有更大的动态范围 (e.g. [-2, 2])
+        # 这允许 DOY 和时间跨度对基准面产生更强的调制，打破了原本均值化限制
+        gamma = torch.tanh(gamma) * 2.0
+        
         gamma = gamma.view(-1, feature.size(1), 1, 1)
         beta = beta.view(-1, feature.size(1), 1, 1)
         return feature * (1 + gamma) + beta
@@ -459,8 +462,8 @@ class CrossScaleLoss(nn.Module):
         label_clean = torch.nan_to_num(label_hr, nan=0.0)
 
         l_cont = self._masked_loss(pred_hr, label_clean, mask_hr)
-        # Pearson 权重 1.0（配合中值滤波去噪后不需要太激进）
-        l_cont += 1.0 * self._pearson_loss(pred_hr, label_clean, mask_hr)
+        # 恢复高强度的皮尔逊散度惩罚，逼迫模型扯开预测图的动态范围(方差)
+        l_cont += 1.5 * self._pearson_loss(pred_hr, label_clean, mask_hr)
 
         # ── L_cons: 物理一致性损失 (PLRU vs MODIS) ────────────────────
         # 动态选取监督目标，如果有聚合格得到的 trend 则优先用趋势特征

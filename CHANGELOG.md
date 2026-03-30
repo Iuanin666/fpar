@@ -1,3 +1,15 @@
+## [2026-03-31 00:20] 🔓 V8.1 释放动态范围：FiLM 调制解绑 & 破除平滑地毯
+> **核心思路**：模型陷入“平庸绿毯”（方差减半）的根源在于过强的数值约束与过早的训练停止。基于前沿的“基准-残差 (Base-Residual) 调制”思想，我们将 MODIS 趋势作为生长基准面，通过释放 DOY 偏移的动态范围约束，放开手脚让模型去拉扯 FPAR 对比度。
+
+### 关键修复 (V8.1)
+| 修复项 | 技术实现 | 解决的问题 (The Why) |
+|------|----------|----------------------|
+| **FiLM 动态解绑** | `gamma = tanh(gamma) * 2.0` | **重获偏移行权**：原先的 `tanh` 把时间调制的倍率锁死在 [-1,1]，导致 DOY 无法大幅度推演 MODIS 基准面。放宽至 [-2,2] 赋予了模型更大的动态修正能力。 |
+| **方差强制拉伸** | Pearson 权重 `1.0` → `1.5` | **惩罚均值回归**：模型为了降低 MSE 倾向于走安全的“均值捷径”。通过 1.5 倍高压的皮尔逊散度惩罚，逼迫模型去还原山林（高 FPAR）和裸土（低 FPAR）的极端差异。 |
+| **持久战耐心** | `EARLY_STOP_PATIENCE`: 35 → 60 | **防止早产**：时空调制（用极小的 3 维特征去映射 512 维特征空间）的学习曲线非常缓慢。原先 62 轮的早停切断了模型的顿悟期。 |
+
+---
+
 ## [2026-03-30 16:30] V8.0 Hotfix 3: Absolute Pearson Gradient Safety & Cleanup
 > **Core**: Eliminate infinite gradient generation mathematically and remove redundant block logic in architectures.
 
