@@ -340,20 +340,19 @@ class FPAR_Fusion_Dataset(Dataset):
         input_tensor[0] = (input_tensor[0].clamp(VV_MIN, VV_MAX) - VV_MIN) / (VV_MAX - VV_MIN)
         input_tensor[1] = (input_tensor[1].clamp(VH_MIN, VH_MAX) - VH_MIN) / (VH_MAX - VH_MIN)
 
-        # ── 构建元数据通道 (DeltaT + DOY) ───────────────────────────
+        # ── 构建元数据特征 (DeltaT + DOY) ───────────────────────────
         # 1. 有符号时间差：S1 日期 - S2 日期 (归一化到约 [-1, 1])
         d1, d2, _ = self.pairs[scene_idx][2], self.pairs[scene_idx][3], self.pairs[scene_idx][4]
         delta_norm = (d1 - d2).days / 30.0
-        delta_channel = torch.full((1, ps, ps), delta_norm, dtype=torch.float32)
 
         # 2. DOY (一年中的第几天) - 周期性三角函数编码
         doy = float(d1.timetuple().tm_yday)
         doy_sin = math.sin(2 * math.pi * doy / 365.25)
         doy_cos = math.cos(2 * math.pi * doy / 365.25)
-        doy_sin_channel = torch.full((1, ps, ps), doy_sin, dtype=torch.float32)
-        doy_cos_channel = torch.full((1, ps, ps), doy_cos, dtype=torch.float32)
+        
+        meta_features = torch.tensor([delta_norm, doy_sin, doy_cos], dtype=torch.float32)
 
-        # ── 拼接最终 8 通道输入: (VV, VH, Elevation, Slope, Aspect, DeltaT, DOY_sin, DOY_cos) ──
+        # ── 拼接最终 5 通道输入: (VV, VH, Elevation, Slope, Aspect) ──
         # 1. 地形通道自适应归一化 (根据全局 Min-Max)
         dem_norm_patches = []
         if self.dem_data is not None:
@@ -368,10 +367,7 @@ class FPAR_Fusion_Dataset(Dataset):
 
         input_tensor = torch.cat([
             input_tensor,           # (2, ps, ps) - VV, VH
-            *dem_norm_patches,      # (3, ps, ps) - Elevation, Slope, Aspect
-            delta_channel,          # (1, ps, ps) - DeltaT
-            doy_sin_channel,        # (1, ps, ps) - DOY_sin
-            doy_cos_channel         # (1, ps, ps) - DOY_cos
+            *dem_norm_patches       # (3, ps, ps) - Elevation, Slope, Aspect
         ], dim=0)
 
         # FPAR 物理范围 0~1，严格强制截断 <0.05 超范围的底噪值以免毒害模型
@@ -394,7 +390,7 @@ class FPAR_Fusion_Dataset(Dataset):
                 input_tensor = torch.rot90(input_tensor, k, [1, 2])
                 label_tensor = torch.rot90(label_tensor, k, [1, 2])
 
-        return input_tensor, label_tensor
+        return input_tensor, label_tensor, meta_features
 
     # ──────────────────────────────────────────────────────────────────
     def get_holdout_dataset(self, patch_size=None):
@@ -408,6 +404,9 @@ class FPAR_Fusion_Dataset(Dataset):
             pairs=self.holdout_pairs,
             s1_dir=self.s1_dir,
             label_dir=self.label_dir,
+            dem_data=self.dem_data,
+            dem_min=self.dem_min,
+            dem_max=self.dem_max,
             patch_size=patch_size or self.patch_size,
         )
 
@@ -419,17 +418,20 @@ class FPAR_Fusion_Dataset(Dataset):
 class _HoldoutDataset(Dataset):
     """不对外使用，仅由 FPAR_Fusion_Dataset.get_holdout_dataset() 创建。"""
 
-    def __init__(self, pairs, s1_dir, label_dir, patch_size=256):
+    def __init__(self, pairs, s1_dir, label_dir, dem_data=None, dem_min=None, dem_max=None, patch_size=256):
         self.pairs = pairs
         self.s1_dir = s1_dir
         self.label_dir = label_dir
+        self.dem_data = dem_data
+        self.dem_min = dem_min
+        self.dem_max = dem_max
         self.patch_size = patch_size
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        s1_fname, s2_fname, *_ = self.pairs[idx]
+        s1_fname, s2_fname, d1, d2, _ = self.pairs[idx]
         s1_path = os.path.join(self.s1_dir, s1_fname)
         label_path = os.path.join(self.label_dir, s2_fname)
 
@@ -438,10 +440,21 @@ class _HoldoutDataset(Dataset):
         with rasterio.open(label_path) as src:
             label_data = src.read(1).astype(np.float32)
 
-        min_h = min(s1_data.shape[1], label_data.shape[0])
-        min_w = min(s1_data.shape[2], label_data.shape[1])
+        h_list = [s1_data.shape[1], label_data.shape[0]]
+        w_list = [s1_data.shape[2], label_data.shape[1]]
+        if self.dem_data is not None:
+            h_list.append(self.dem_data.shape[1])
+            w_list.append(self.dem_data.shape[2])
+        
+        min_h = min(h_list)
+        min_w = min(w_list)
+
         s1_data = s1_data[:, :min_h, :min_w]
         label_data = label_data[:min_h, :min_w]
+        if self.dem_data is not None:
+            dem_aligned = self.dem_data[:, :min_h, :min_w]
+        else:
+            dem_aligned = np.zeros((3, min_h, min_w), dtype=np.float32)
 
         _, H, W = s1_data.shape
         ps = self.patch_size
@@ -450,6 +463,7 @@ class _HoldoutDataset(Dataset):
 
         s1_patch = s1_data[:, top:top + ps, left:left + ps]
         label_patch = label_data[top:top + ps, left:left + ps]
+        dem_patch = dem_aligned[:, top:top + ps, left:left + ps]
 
         input_tensor = torch.from_numpy(s1_patch.copy()).float()
         label_tensor = torch.from_numpy(label_patch.copy()).float().unsqueeze(0)
@@ -460,5 +474,27 @@ class _HoldoutDataset(Dataset):
         VH_MIN, VH_MAX = -35.0, 5.0
         input_tensor[0] = (input_tensor[0].clamp(VV_MIN, VV_MAX) - VV_MIN) / (VV_MAX - VV_MIN)
         input_tensor[1] = (input_tensor[1].clamp(VH_MIN, VH_MAX) - VH_MIN) / (VH_MAX - VH_MIN)
+        
+        # ── 构建元数据通道 ──
+        delta_norm = (d1 - d2).days / 30.0
+        doy = float(d1.timetuple().tm_yday)
+        doy_sin = math.sin(2 * math.pi * doy / 365.25)
+        doy_cos = math.cos(2 * math.pi * doy / 365.25)
+        meta_features = torch.tensor([delta_norm, doy_sin, doy_cos], dtype=torch.float32)
+
+        # ── 拼接最终 5 通道输入 ──
+        dem_norms = []
+        if self.dem_data is not None and self.dem_min and self.dem_max:
+            for i in range(3):
+                p = dem_patch[i]
+                denom = self.dem_max[i] - self.dem_min[i]
+                p_n = (p - self.dem_min[i]) / (denom if denom > 1e-6 else 1.0)
+                dem_norms.append(torch.from_numpy(p_n[np.newaxis].copy()).float())
+        else:
+            for i in range(3):
+                dem_norms.append(torch.zeros((1, ps, ps), dtype=torch.float32))
+
+        input_tensor = torch.cat([input_tensor, *dem_norms], dim=0)
+
         label_tensor = torch.clamp(label_tensor, 0.0, 1.0)
-        return input_tensor, label_tensor
+        return input_tensor, label_tensor, meta_features

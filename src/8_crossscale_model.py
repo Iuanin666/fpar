@@ -60,7 +60,49 @@ class ChannelAttention(nn.Module):
         B, C, _, _ = x.shape
         y = self.avg_pool(x).view(B, C)
         y = self.fc(y).view(B, C, 1, 1)
+    def forward(self, x):
+        B, C, _, _ = x.shape
+        y = self.avg_pool(x).view(B, C)
+        y = self.fc(y).view(B, C, 1, 1)
         return x * y
+
+
+class TemporalContextAggregator(nn.Module):
+    """
+    将前后3个时相的 MODIS 融合成1个物理趋势特征。
+    """
+    def __init__(self, in_seq=3, out_channels=1):
+        super().__init__()
+        self.agg = nn.Sequential(
+            nn.Conv2d(in_seq, 16, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, out_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, modis_seq):
+        return self.agg(modis_seq)
+
+
+class FiLM_Layer(nn.Module):
+    """
+    Feature-wise Linear Modulation: 使用1D元数据动态特征重标定
+    """
+    def __init__(self, meta_dim=3, target_dim=512):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(meta_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, target_dim * 2)
+        )
+
+    def forward(self, feature, meta):
+        film_params = self.mlp(meta)
+        gamma, beta = film_params.chunk(2, dim=1)
+        gamma = gamma.view(-1, feature.size(1), 1, 1)
+        beta = beta.view(-1, feature.size(1), 1, 1)
+        return feature * (1 + gamma) + beta
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -70,10 +112,10 @@ class ChannelAttention(nn.Module):
 class HREncoder(nn.Module):
     """
     多尺度编码器,提取 S1 SAR + Terrain 的空间纹理特征。
-    输入: (B, 7, 256, 256)
+    输入: (B, 5, 256, 256)
     输出: 多层特征 [f1(64,256,256), f2(128,128,128), f3(256,64,64), f4(512,32,32)]
     """
-    def __init__(self, in_channels=7):
+    def __init__(self, in_channels=5):
         super().__init__()
         self.enc1 = ConvBlock(in_channels, 64)
         self.enc2 = ConvBlock(64, 128)
@@ -298,50 +340,57 @@ class CrossScaleFPARNet(nn.Module):
     """
     双向拼接对比学习 FPAR 反演网络
 
-    训练时返回: (pred_hr, plru, phru)
+    训练时返回: (pred_hr, plru, phru, modis_agg)
     推理时返回: pred_hr
     """
-    def __init__(self, in_channels=8, lr_size=5, patch_size=256):
+    def __init__(self, in_channels=5, lr_size=5, patch_size=256):
         super().__init__()
         self.patch_size = patch_size
 
         # 核心模块
         self.hr_encoder = HREncoder(in_channels)
+        self.film = FiLM_Layer(meta_dim=3, target_dim=512)
+        self.temporal_agg = TemporalContextAggregator(in_seq=3, out_channels=1)
         self.aggregation = AggregationModule(hr_channels=512, lr_size=lr_size)
         self.disaggregation = DisaggregationModule(guide_channels=512, target_size=patch_size)
         self.cross_transformer = CrossScaleTransformer(embed_dim=512)
         self.decoder = Decoder()
 
-    def forward(self, s1_input, modis_lr=None):
+    def forward(self, s1_input, meta_features=None, modis_lr=None):
         """
-        s1_input: (B, 7, 256, 256) - S1 SAR + Terrain + Meta
-        modis_lr: (B, 1, lr_h, lr_w) - MODIS FPAR (仅用于训练时的知识蒸馏监督)
+        s1_input: (B, 5, 256, 256) - S1 SAR + Terrain
+        meta_features: (B, 3) - DeltaT, DOY_sin, DOY_cos
+        modis_lr: (B, 3, lr_h, lr_w) - MODIS FPAR sequence
         """
         # 1. HR Encoder
         f1, f2, f3, f4 = self.hr_encoder(s1_input)
 
+        # FiLM 元数据动态特征重标定
+        if meta_features is not None:
+            f4 = self.film(f4, meta_features)
+
         # 2. Aggregation: 高→低 (生成 PLRU)
         plru = self.aggregation(f4)  # (B, 1, 5, 5)
 
-        # 3. Disaggregation: 低→高 (生成 PHRU)
+        # 3. Temporal Aggregation & Disaggregation
+        modis_agg = None
         if modis_lr is not None:
-            # 训练时：用真实 MODIS 测试拆解能力，通过 L_phru 约束学习
-            phru = self.disaggregation(modis_lr, f4)  # (B, 1, 256, 256)
+            # 训练时：聚合多时相趋势，用真实连续性测试拆解能力
+            modis_agg = self.temporal_agg(modis_lr)
+            phru = self.disaggregation(modis_agg, f4)  # (B, 1, 256, 256)
         else:
             # 推理时：使用自己生成的 PLRU 拆解
             phru = self.disaggregation(plru, f4)
 
         # 4. CrossScale Transformer [核心修复！]
         # 无论训练还是推理，统一使用自己生成的 plru。
-        # 断绝模型对真实 MODIS 的"偷懒依赖"，迫使网络从 S1 雷达纹理中硬推 FPAR。
-        # MODIS 只通过 L_cons 和 L_phru 提供知识蒸馏监督。
         bottleneck = self.cross_transformer(f4, plru)
 
         # 5. Decoder
         pred_hr = self.decoder(bottleneck, [f1, f2, f3])
 
         if self.training or modis_lr is not None:
-            return pred_hr, plru, phru
+            return pred_hr, plru, phru, modis_agg
         else:
             return pred_hr
 
@@ -382,14 +431,14 @@ class CrossScaleLoss(nn.Module):
         pearson = cov / (std_p * std_t)
         return 1.0 - pearson
 
-    def forward(self, pred_hr, plru, phru, label_hr, modis_lr,
-                prev_pred=None, delta_t=None):
+    def forward(self, pred_hr, plru, phru, label_hr, modis_lr, modis_agg=None, prev_pred=None, delta_t=None):
         """
         pred_hr:   (B, 1, H, W)     - 最终 10m FPAR 预测
         plru:      (B, 1, 5, 5)     - 聚合生成的低分伪 FPAR
         phru:      (B, 1, H, W)     - 拆解生成的高分伪 FPAR
         label_hr:  (B, 1, H, W)     - S2 真值
-        modis_lr:  (B, 1, lr_h, lr_w) - MODIS 真值
+        modis_lr:  (B, 3, lr_h, lr_w) - MODIS 真值序列 (T-1, T0, T+1)
+        modis_agg: (B, 1, lr_h, lr_w) - 经过 TemporalContextAggregator 的聚合先验
         prev_pred: (B, 1, H, W)     - 上一个时间步的预测 (可选)
         delta_t:   (B,)              - 每个样本的 S1-S2 时间差天数 (可选)
         """
@@ -402,9 +451,15 @@ class CrossScaleLoss(nn.Module):
         l_cont += 1.0 * self._pearson_loss(pred_hr, label_clean, mask_hr)
 
         # ── L_cons: 物理一致性损失 (PLRU vs MODIS) ────────────────────
+        # 动态选取监督目标，如果有聚合格得到的 trend 则优先用趋势特征
+        if modis_agg is not None:
+            modis_target = modis_agg.detach()
+        else:
+            modis_target = modis_lr[:, 1:2, :, :] if modis_lr.shape[1] == 3 else modis_lr
+        
         # 将 MODIS 下采样到 PLRU 的尺度
         _, _, ph, pw = plru.shape
-        modis_ds = F.interpolate(modis_lr, size=(ph, pw), mode='bilinear', align_corners=False)
+        modis_ds = F.interpolate(modis_target, size=(ph, pw), mode='bilinear', align_corners=False)
         mask_lr = (modis_ds > 0.01).float()
         l_cons = self._masked_loss(plru, modis_ds, mask_lr)
 
@@ -446,29 +501,30 @@ class CrossScaleLoss(nn.Module):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = CrossScaleFPARNet(in_channels=8, lr_size=5, patch_size=256).to(device)
+    model = CrossScaleFPARNet(in_channels=5, lr_size=5, patch_size=256).to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"CrossScaleFPARNet 参数量: {total_params:.2f} M")
 
     # 模拟输入
-    s1 = torch.randn(2, 8, 256, 256).to(device)
-    modis = torch.randn(2, 1, 5, 5).to(device)
+    s1 = torch.randn(2, 5, 256, 256).to(device)
+    meta = torch.randn(2, 3).to(device)
+    modis = torch.randn(2, 3, 5, 5).to(device)
 
     # 训练模式
     model.train()
-    pred, plru, phru = model(s1, modis)
-    print(f"Train - pred: {pred.shape}, plru: {plru.shape}, phru: {phru.shape}")
+    pred, plru, phru, modis_agg = model(s1, meta_features=meta, modis_lr=modis)
+    print(f"Train - pred: {pred.shape}, plru: {plru.shape}, phru: {phru.shape}, modis_agg: {modis_agg.shape}")
 
     # 推理模式
     model.eval()
     with torch.no_grad():
-        pred = model(s1)  # 不需要 MODIS
+        pred = model(s1, meta_features=meta)  # 不需要 MODIS
     print(f"Eval  - pred: {pred.shape}")
 
     # 测试损失
     label = torch.rand(2, 1, 256, 256).to(device)
     loss_fn = CrossScaleLoss()
     model.train()
-    pred, plru, phru = model(s1, modis)
-    loss, details = loss_fn(pred, plru, phru, label, modis)
+    pred, plru, phru, modis_agg = model(s1, meta_features=meta, modis_lr=modis)
+    loss, details = loss_fn(pred, plru, phru, label, modis, modis_agg=modis_agg)
     print(f"Loss: {details}")

@@ -58,7 +58,7 @@ MODEL_SAVE_DIR = r"E:\FPAR_project\models"
 LOG_DIR        = r"E:\FPAR_project\runs_crossscale"
 
 HOLDOUT_DATE      = "20250719"
-IN_CHANNELS       = 8        # V7.3: VV, VH, Elev, Slope, Aspect, DeltaT, DOY_sin, DOY_cos
+IN_CHANNELS       = 5        # V8.0: VV, VH, Elev, Slope, Aspect
 BATCH_SIZE        = 4       # CrossScale 模型较大，从安全起步
 PATCH_SIZE        = 256
 LR_SIZE           = 5       # MODIS patch 在模型中的逻辑尺寸
@@ -182,17 +182,26 @@ class CrossScaleDataset(Dataset):
             d1_best = _parse_s1_date(s1_files[best_s1_idx])
 
             # --- 找最近的 MODIS (以 S2 为主心骨) ---
-            best_modis_f, best_modis_delta = None, float("inf")
-            for md, mf in self.modis_dates:
-                # 使用 S2 时间去找 MODIS
+            best_modis_idx, best_modis_delta = -1, float("inf")
+            for k, (md, mf) in enumerate(self.modis_dates):
                 md_delta = abs((d2 - md).days)
                 if md_delta < best_modis_delta:
                     best_modis_delta = md_delta
-                    best_modis_f = mf
+                    best_modis_idx = k
+            
+            # T-1, T0, T+1 indices
+            idx_prev = max(0, best_modis_idx - 1)
+            idx_next = min(len(self.modis_dates) - 1, best_modis_idx + 1)
+            
+            modis_files_seq = (
+                self.modis_dates[idx_prev][1],
+                self.modis_dates[best_modis_idx][1],
+                self.modis_dates[idx_next][1]
+            )
 
             raw_pairs.append((
                 s1_files[best_s1_idx], s2f, d1_best, d2,
-                best_s1_delta, best_modis_f, best_modis_delta
+                best_s1_delta, modis_files_seq, best_modis_delta
             ))
 
         # 过滤 holdout
@@ -204,9 +213,9 @@ class CrossScaleDataset(Dataset):
 
         if verbose:
             print(f"\n[数据集 split='{split}'] 有效配对: {len(self.pairs)} 景")
-            for i, (s1f, s2f, d1, d2, dt, mf, mdt) in enumerate(self.pairs):
+            for i, (s1f, s2f, d1, d2, dt, mseq, mdt) in enumerate(self.pairs):
                 print(f"  {i+1}: S2={d2.strftime('%Y-%m-%d')} (基准) <-> S1={d1.strftime('%Y-%m-%d')} "
-                      f"(差{dt}天) | MODIS={mf} (差{mdt}天)")
+                      f"(差{dt}天) | MODIS={mseq[1]} (差{mdt}天)")
 
         if not self.pairs:
             raise RuntimeError("有效配对为 0!")
@@ -218,7 +227,7 @@ class CrossScaleDataset(Dataset):
 
     def __getitem__(self, idx):
         scene_idx = idx // self.samples_per_image
-        s1_fname, s2_fname, d1, d2, _, modis_fname, _ = self.pairs[scene_idx]
+        s1_fname, s2_fname, d1, d2, _, modis_fname_seq, _ = self.pairs[scene_idx]
 
         # ── 缓存数据 ──────────────────────────────────────────────────
         if scene_idx not in self.cache:
@@ -308,40 +317,44 @@ class CrossScaleDataset(Dataset):
             p_n = (p - self.dem_min[i]) / (denom if denom > 1e-6 else 1.0)
             dem_norms.append(torch.from_numpy(p_n[np.newaxis].copy()).float())
 
-        # 元数据通道
+        # 元数据特征
         delta_days = abs((d1 - d2).days)  # 保留绝对天数，给 Loss 做时间衰减
         delta_norm = (d1 - d2).days / 30.0
         doy = float(d1.timetuple().tm_yday)
         doy_sin = math.sin(2 * math.pi * doy / 365.25)
         doy_cos = math.cos(2 * math.pi * doy / 365.25)
-        delta_ch = torch.full((1, ps, ps), delta_norm, dtype=torch.float32)
-        doy_sin_ch = torch.full((1, ps, ps), doy_sin, dtype=torch.float32)
-        doy_cos_ch = torch.full((1, ps, ps), doy_cos, dtype=torch.float32)
+        meta_features = torch.tensor([delta_norm, doy_sin, doy_cos], dtype=torch.float32)
 
-        input_tensor = torch.cat([s1_t, *dem_norms, delta_ch, doy_sin_ch, doy_cos_ch], dim=0)  # (8, ps, ps)
+        input_tensor = torch.cat([s1_t, *dem_norms], dim=0)  # (5, ps, ps)
 
         # ── 严格 0.05 过滤: 设为 NaN 而非 0 ──────────────────────────
         label_t = torch.from_numpy(label_patch.copy()).float().unsqueeze(0)
         label_t = torch.nan_to_num(label_t, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
         label_t[(label_t < 0.05) | (label_t > 1.0)] = float('nan')
 
-        # ── MODIS 裁剪 ───────────────────────────────────────────────
-        modis_full = self.modis_cache.get(modis_fname)
-        if modis_full is not None:
-            mH, mW = modis_full.shape
-            # 计算 MODIS 与 S1 的像素比例
-            scale_h = mH / H
-            scale_w = mW / W
-            m_top = int(top * scale_h)
-            m_left = int(left * scale_w)
-            m_h = max(1, int(ps * scale_h))
-            m_w = max(1, int(ps * scale_w))
-            m_top = min(m_top, max(0, mH - m_h))
-            m_left = min(m_left, max(0, mW - m_w))
-            modis_patch = modis_full[m_top:m_top+m_h, m_left:m_left+m_w]
-            modis_t = torch.from_numpy(modis_patch.copy()).float().unsqueeze(0)  # (1, m_h, m_w)
-        else:
-            modis_t = torch.zeros((1, LR_SIZE, LR_SIZE), dtype=torch.float32)
+        # ── MODIS 裁剪 (提取 T-1, T0, T+1) ───────────────────────────
+        modis_patches = []
+        for mf in modis_fname_seq:
+            modis_full = self.modis_cache.get(mf)
+            if modis_full is not None:
+                mH, mW = modis_full.shape
+                # 计算 MODIS 与 S1 的像素比例
+                scale_h = mH / H
+                scale_w = mW / W
+                m_top = int(top * scale_h)
+                m_left = int(left * scale_w)
+                m_h = max(1, int(ps * scale_h))
+                m_w = max(1, int(ps * scale_w))
+                m_top = min(m_top, max(0, mH - m_h))
+                m_left = min(m_left, max(0, mW - m_w))
+                patch = modis_full[m_top:m_top+m_h, m_left:m_left+m_w]
+                modis_patches.append(torch.from_numpy(patch.copy()).float())
+            else:
+                # 极端异常情况 fallback
+                modis_patches.append(torch.zeros((LR_SIZE, LR_SIZE), dtype=torch.float32))
+        
+        # 统一大小: 假设 m_h, m_w 一致
+        modis_t = torch.stack(modis_patches, dim=0)  # (3, m_h, m_w)
 
         # ── 数据增强（仅训练集）────────────────────────────────────────
         if self.split == "train":
@@ -365,7 +378,7 @@ class CrossScaleDataset(Dataset):
             median_val = patches.contiguous().view(1, ps, ps, 9).median(dim=-1).values
             label_t = torch.where(valid_mask, median_val, label_t)
 
-        return input_tensor, label_t, modis_t, delta_days
+        return input_tensor, label_t, modis_t, delta_days, meta_features
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -378,19 +391,20 @@ def get_lr(optimizer):
 
 def custom_collate(batch):
     """自定义 collate: MODIS patch 大小可能不同, 统一 resize 到 LR_SIZE."""
-    inputs, labels, modis_list, delta_days_list = zip(*batch)
+    inputs, labels, modis_list, delta_days_list, meta_features_list = zip(*batch)
     inputs = torch.stack(inputs)
     labels = torch.stack(labels)
     delta_days = torch.tensor(delta_days_list, dtype=torch.float32)  # (B,)
+    meta_features = torch.stack(meta_features_list) # (B, 3)
     # Resize MODIS patches to uniform size
     modis_resized = []
-    for m in modis_list:
+    for m in modis_list: # m is (3, m_h, m_w)
         m_r = torch.nn.functional.interpolate(
             m.unsqueeze(0), size=(LR_SIZE, LR_SIZE), mode='bilinear', align_corners=False
-        ).squeeze(0)
+        ).squeeze(0) # back to (3, LR_SIZE, LR_SIZE)
         modis_resized.append(m_r)
     modis = torch.stack(modis_resized)
-    return inputs, labels, modis, delta_days
+    return inputs, labels, modis, delta_days, meta_features
 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, num_epochs, use_amp):
@@ -401,19 +415,20 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, epoch, nu
 
     pbar = tqdm(loader, desc=f"Train [{epoch+1:>3}/{num_epochs}]", ncols=110, leave=False)
 
-    for inputs, labels, modis, delta_days in pbar:
+    for inputs, labels, modis, delta_days, meta_features in pbar:
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         modis  = modis.to(device, non_blocking=True)
         delta_days = delta_days.to(device, non_blocking=True)
+        meta_features = meta_features.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         amp_ctx = (autocast(_AMP_DEVICE, enabled=use_amp)
                    if _AMP_DEVICE else autocast(enabled=use_amp))
         with amp_ctx:
-            pred_hr, plru, phru = model(inputs, modis)
-            loss, details = loss_fn(pred_hr, plru, phru, labels, modis, delta_t=delta_days)
+            pred_hr, plru, phru, modis_agg = model(inputs, meta_features=meta_features, modis_lr=modis)
+            loss, details = loss_fn(pred_hr, plru, phru, labels, modis, modis_agg=modis_agg, delta_t=delta_days)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -439,17 +454,18 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, num_epochs, use_am
 
     pbar = tqdm(loader, desc=f"Val   [{epoch+1:>3}/{num_epochs}]", ncols=110, leave=False)
 
-    for inputs, labels, modis, delta_days in pbar:
+    for inputs, labels, modis, delta_days, meta_features in pbar:
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         modis  = modis.to(device, non_blocking=True)
         delta_days = delta_days.to(device, non_blocking=True)
+        meta_features = meta_features.to(device, non_blocking=True)
 
         amp_ctx = (autocast(_AMP_DEVICE, enabled=use_amp)
                    if _AMP_DEVICE else autocast(enabled=use_amp))
         with amp_ctx:
-            pred_hr, plru, phru = model(inputs, modis)
-            loss, _ = loss_fn(pred_hr, plru, phru, labels, modis, delta_t=delta_days)
+            pred_hr, plru, phru, modis_agg = model(inputs, meta_features=meta_features, modis_lr=modis)
+            loss, _ = loss_fn(pred_hr, plru, phru, labels, modis, modis_agg=modis_agg, delta_t=delta_days)
 
         epoch_loss += loss.item()
         pbar.set_postfix(loss=f"{loss.item():.4f}")
