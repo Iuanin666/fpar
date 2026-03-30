@@ -348,7 +348,10 @@ class CrossScaleDataset(Dataset):
                 m_top = min(m_top, max(0, mH - m_h))
                 m_left = min(m_left, max(0, mW - m_w))
                 patch = modis_full[m_top:m_top+m_h, m_left:m_left+m_w]
-                modis_patches.append(torch.from_numpy(patch.copy()).float())
+                patch_tensor = torch.from_numpy(patch.copy()).float()
+                # 修复: 清除 NaN，避免 Loss 计算时被污染导致梯队全境 NaN
+                patch_tensor = torch.nan_to_num(patch_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+                modis_patches.append(patch_tensor)
             else:
                 # 极端异常情况 fallback
                 modis_patches.append(torch.zeros((LR_SIZE, LR_SIZE), dtype=torch.float32))
@@ -361,13 +364,16 @@ class CrossScaleDataset(Dataset):
             if random.random() > 0.5:
                 input_tensor = torch.flip(input_tensor, [2])
                 label_t = torch.flip(label_t, [2])
+                modis_t = torch.flip(modis_t, [2])
             if random.random() > 0.5:
                 input_tensor = torch.flip(input_tensor, [1])
                 label_t = torch.flip(label_t, [1])
+                modis_t = torch.flip(modis_t, [1])
             k = random.randint(0, 3)
             if k > 0:
                 input_tensor = torch.rot90(input_tensor, k, [1, 2])
                 label_t = torch.rot90(label_t, k, [1, 2])
+                modis_t = torch.rot90(modis_t, k, [1, 2])
 
         # ── 标签中值滤波（去椒盐噪声，保留边缘）────────────────────
         if self.split == "train":

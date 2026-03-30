@@ -1,3 +1,15 @@
+## [2026-03-30 16:05] V8.0 Stability Patch: NaN & Gradient Flow Fix
+> **Core**: Fix critical training crashes due to NaN-contaminated MODIS sensors and disconnected gradient graphs in masked loss modules.
+
+### Fixes (V8.0 Patch)
+| Category | Fix | The Why |
+|----------|-----|---------|
+| **NaN Shield** | `torch.nan_to_num` for MODIS patches | **Training Safety**: Coastal/rainy MODIS pixels often contain NaNs. Filtering these to 0.0 prevents "loss = nan" propagation into the CNN/FiLM weights. |
+| **Gradient Flow** | `(pred * 0.0).sum()` return in `_masked_loss` | **Fixing 0-Mask Crash**: When a patch has 0 valid pixels, `new_tensor(0.0)` created a detached node. Using `(pred * 0.0).sum()` keeps the gradient graph connected, avoiding the `RuntimeError`. |
+| **Augmentation** | Sync `modis_t` flips with `input_tensor` | **Spatial Consistency**: Fixed a bug where MODIS constraints were and not mirrored during data augmentation, leading to spatial misalignment in $L_{cons}$. |
+
+---
+
 ## [2026-03-30 15:00] V8.0 Temporal Context Aggregator & FiLM Metadata Injection
 > **Core**: Tackle MODIS cloud contamination via multi-temporal aggregation and prevent metadata dilution using FiLM modulation.
 

@@ -415,7 +415,7 @@ class CrossScaleLoss(nn.Module):
         """计算掩膜后的 Huber Loss"""
         valid_count = mask.sum()
         if valid_count < 2:
-            return pred.new_tensor(0.0)
+            return (pred * 0.0).sum()
         loss = (self.huber(pred, target) * mask).sum() / valid_count
         return loss
 
@@ -424,7 +424,7 @@ class CrossScaleLoss(nn.Module):
         p = pred[mask > 0]
         t = target[mask > 0]
         if p.numel() < 2:
-            return pred.new_tensor(0.0)
+            return (pred * 0.0).sum()
         mean_p, std_p = p.mean(), p.std() + 1e-8
         mean_t, std_t = t.mean(), t.std() + 1e-8
         cov = ((p - mean_p) * (t - mean_t)).mean()
