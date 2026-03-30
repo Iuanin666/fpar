@@ -60,10 +60,6 @@ class ChannelAttention(nn.Module):
         B, C, _, _ = x.shape
         y = self.avg_pool(x).view(B, C)
         y = self.fc(y).view(B, C, 1, 1)
-    def forward(self, x):
-        B, C, _, _ = x.shape
-        y = self.avg_pool(x).view(B, C)
-        y = self.fc(y).view(B, C, 1, 1)
         return x * y
 
 
@@ -428,20 +424,23 @@ class CrossScaleLoss(nn.Module):
         if p.numel() < 2:
             return (pred * 0.0).sum()
         
-        std_p = p.std()
-        std_t = t.std()
-        
-        # 极重要！AMP fp16 下 1e-8 会被截断为 0。
-        # 如果 Patch 几乎全平（std ≈ 0），直接触发除零大爆炸。必须在分子/分母计算前硬拦截。
-        if std_p < 1e-4 or std_t < 1e-4:
-            return (pred * 0.0).sum()
-            
         mean_p = p.mean()
         mean_t = t.mean()
         
+        # 核心病灶 A：避开 torch.std() 带来的零点求导无界爆炸！
+        # 我们手动用方差计算，并在 sqrt 前预先注入平滑因子 eps，彻底封死无穷大梯度。
+        var_p = torch.mean((p - mean_p) ** 2)
+        var_t = torch.mean((t - mean_t) ** 2)
+        
+        # 极小方差短路，防止 flat-patch 导致后续无意义学习
+        if var_p < 1e-6 or var_t < 1e-6:
+            return (pred * 0.0).sum()
+            
+        std_p = torch.sqrt(var_p + 1e-8)
+        std_t = torch.sqrt(var_t + 1e-8)
+        
         cov = ((p - mean_p) * (t - mean_t)).mean()
-        # 分母再加一次微小保护，防止前两步精度折损
-        pearson = cov / (std_p * std_t + 1e-8)
+        pearson = cov / (std_p * std_t)
         return 1.0 - pearson
 
     def forward(self, pred_hr, plru, phru, label_hr, modis_lr, modis_agg=None, prev_pred=None, delta_t=None):
