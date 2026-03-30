@@ -157,13 +157,16 @@ def sliding_window_inference(
 ) -> np.ndarray:
     """
     对整景 S1 影像做滑动窗口推理，返回与输入同空间分辨率的预测 FPAR 图（H, W）。
-    输入包含 8 个通道: [VV, VH, Elevation, Slope, Aspect, DeltaT, DOY_sin, DOY_cos]
+    输入包含 5 或 8 个通道，视模型版本而定。
     """
     _, H, W = s1_data.shape
     pred_sum = np.zeros((H, W), dtype=np.float32)
     count    = np.zeros((H, W), dtype=np.float32)
 
     model.eval()
+
+    # 预先打包 meta_features 为 (1, 3) Tensor (针对 V8.0 模型)
+    meta_tensor = torch.tensor([[delta_norm, doy_sin, doy_cos]], dtype=torch.float32).to(device)
 
     tops  = list(range(0, H - patch_size + 1, stride))
     lefts = list(range(0, W - patch_size + 1, stride))
@@ -174,7 +177,10 @@ def sliding_window_inference(
     VV_MIN, VV_MAX = -30.0, 5.0
     VH_MIN, VH_MAX = -35.0, 5.0
 
-    print(f"  [推理] 正在执行 8-通道滑动窗口推理...")
+    # 检查是否为 CrossScale V8.0 模型
+    is_v8_crossscale = isinstance(model, CrossScaleFPARNet)
+    ch_str = "5-通道 (V8.0)" if is_v8_crossscale else "8-通道 (V7.3)"
+    print(f"  [推理] 正在执行 {ch_str} 滑动窗口推理...")
 
     with torch.no_grad():
         for top in tops:
@@ -194,17 +200,23 @@ def sliding_window_inference(
                     norm = (p_dem[i] - dem_min[i]) / (denom if denom > 1e-6 else 1.0)
                     p_dem_norms.append(torch.from_numpy(norm[np.newaxis]).float())
                 
-                # 4. 构造 8 通道 Tensor: [2 S1, 3 Terrain, 1 Delta, 1 DOY_sin, 1 DOY_cos]
+                # 4. 构造输入 Tensor
                 t_s1    = torch.from_numpy(p_s1).float()
                 t_dem   = torch.cat(p_dem_norms, dim=0)
-                t_delta = torch.full((1, patch_size, patch_size), delta_norm, dtype=torch.float32)
-                t_doy_sin = torch.full((1, patch_size, patch_size), doy_sin, dtype=torch.float32)
-                t_doy_cos = torch.full((1, patch_size, patch_size), doy_cos, dtype=torch.float32)
                 
-                x = torch.cat([t_s1, t_dem, t_delta, t_doy_sin, t_doy_cos], dim=0).unsqueeze(0).to(device)
-
-                with autocast(enabled=use_amp):
-                    y = model(x)
+                if is_v8_crossscale:
+                    # V8.0: 拼接 5 个通道 (VV, VH, Elev, Slope, Aspect)
+                    x = torch.cat([t_s1, t_dem], dim=0).unsqueeze(0).to(device)
+                    with autocast(enabled=use_amp):
+                        y = model(x, meta_features=meta_tensor)
+                else:
+                    # 遗留版本: 构造 8 通道 Tensor: [2 S1, 3 Terrain, 1 Delta, 1 DOY_sin, 1 DOY_cos]
+                    t_delta = torch.full((1, patch_size, patch_size), delta_norm, dtype=torch.float32)
+                    t_doy_sin = torch.full((1, patch_size, patch_size), doy_sin, dtype=torch.float32)
+                    t_doy_cos = torch.full((1, patch_size, patch_size), doy_cos, dtype=torch.float32)
+                    x = torch.cat([t_s1, t_dem, t_delta, t_doy_sin, t_doy_cos], dim=0).unsqueeze(0).to(device)
+                    with autocast(enabled=use_amp):
+                        y = model(x)
 
                 pred_patch = y[0, 0].cpu().float().numpy()
                 pred_sum[top:top+patch_size, left:left+patch_size] += pred_patch
@@ -448,16 +460,19 @@ def main():
     # ── 2. 加载模型 ───────────────────────────────────────────────────
     if args.model == "unet":
         model_path = UNET_MODEL_PATH
+        in_ch = 7  # DualStreamUNet 内部硬编码 5+2=7
         print(f"\n[步骤 2] 加载 Dual-Stream U-Net 模型: {model_path}")
-        model = DualStreamUNet(in_channels=IN_CHANNELS, out_channels=1).to(device)
+        model = DualStreamUNet(in_channels=in_ch, out_channels=1).to(device)
     elif args.model == "transformer":
         model_path = TRANSFORMER_MODEL_PATH
+        in_ch = 7 # DualStreamTransformer 内部默认为 7
         print(f"\n[步骤 2] 加载 Transformer 模型: {model_path}")
-        model = DualStreamTransformer(in_channels=IN_CHANNELS, out_channels=1, img_size=PATCH_SIZE).to(device)
+        model = DualStreamTransformer(in_channels=in_ch, out_channels=1, img_size=PATCH_SIZE).to(device)
     else:
         model_path = CROSSSCALE_MODEL_PATH
+        in_ch = 5 # V8.0 CrossScale 模型使用 5 通道
         print(f"\n[步骤 2] 加载 CrossScale 模型: {model_path}")
-        model = CrossScaleFPARNet(in_channels=IN_CHANNELS, patch_size=PATCH_SIZE).to(device)
+        model = CrossScaleFPARNet(in_channels=in_ch, patch_size=PATCH_SIZE).to(device)
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(
